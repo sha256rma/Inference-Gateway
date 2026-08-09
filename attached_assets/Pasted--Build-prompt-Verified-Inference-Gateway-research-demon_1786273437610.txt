@@ -1,0 +1,436 @@
+# Build prompt: Verified Inference Gateway (research demonstrator, front end only)
+
+## What you are building
+
+A single-page web application that demonstrates a research proposal for verifiable AI
+inference. An AI engineer uploads model weights, the system compiles them to an arithmetic
+circuit and publishes a cryptographic commitment at an "audit event", and thereafter users
+can chat with that model while a subset of responses carry a zero-knowledge proof that the
+output was produced by the committed weights.
+
+This is a **mockup**. No real cryptography, no real model serving, no real proving. Every
+proof, timing, and hash is simulated. But the interface, the state machine, and above all
+the stated guarantees must be technically accurate, because the audience is cryptography
+and AI safety researchers who will know when a claim is wrong. Every number in this
+document has been checked against the primary source listed in the Source Register at the
+end; wire each number's tooltip to its register entry.
+
+## Honesty mandate (the most important instruction in this document)
+
+Do not build a demo that implies more than the research supports. Three claims must be
+visible throughout the product, not buried:
+
+1. **A proof of correct inference proves execution integrity only.** It shows the committed
+   weights produced this output. It says nothing about whether the output was correct,
+   safe, or appropriate. The proof certifies a harmful answer as readily as a safe one.
+2. **The costs are currently prohibitive at LLM scale.** Show real numbers from the
+   literature (Source Register, entries S1 to S9), not aspirational ones.
+3. **Passing verification is not proof of honest work.** The Hollow-LLM attack (Gong, Liu,
+   and Li, IEEE S&P 2026) constructs cheap "ghost weights" that satisfy the same
+   verification circuit. In the authors' words, proof of correct inference is not proof of
+   large-model execution.
+
+Where the mockup simulates something, label it. A small monospace tag reading
+`SIMULATED` should appear on any panel showing fabricated cryptographic output.
+
+## Stack
+
+- React + TypeScript, Vite
+- Tailwind CSS
+- No backend. All state in memory (React context or Zustand). No localStorage.
+- Framer Motion for the proof-generation and handshake animations
+- lucide-react for icons
+- recharts for the cost/latency charts
+- Mock everything behind a `src/mock/` module with realistic async delays, so a real
+  backend could be swapped in later without touching components
+
+## Design system
+
+Editorial and technical, not SaaS-glossy. Think a broadsheet newspaper crossed with
+Bauhaus: heavy rules, generous whitespace, restrained colour.
+
+- Palette: Charcoal `#1C1B1A`, Cream `#F4F1EA`, Cream Dark `#E5E0D5`,
+  Terracotta `#C4622D`, Forest `#2D4A3E`, Ochre `#D9A441`
+- Typography: Playfair Display for headings, Inter for body, JetBrains Mono for all
+  hashes, commitments, proof bytes, and circuit statistics
+- Semantic colour use: Forest for verified, Terracotta for failed or unverified,
+  Ochre for pending or degraded, Charcoal for neutral
+- Hard 1px rules between sections rather than card shadows
+- No gradients, no glassmorphism, no emoji
+
+## The pipeline the app models
+
+Five stages. The UI is organised around them.
+
+### Stage 1: Upload
+
+User drops a `.safetensors` file (also accept `.onnx`, `.gguf`; these three are exactly
+the formats DeepProve, the most deployed zkML system, ingests, so the choice is
+defensible [S7]). Show parsed metadata: tensor count, parameter count, dtype,
+architecture guess, file size, SHA-256 of the file. Simulate the parse; do not actually
+read the binary beyond size and name.
+
+Include a **preflight check** panel that reports whether the model is circuit-compatible.
+This is where much of the technical honesty lives. Report per-operator status in three
+tiers:
+
+- Native to arithmetic circuits: MatMul, Gemm, Add, Conv, Reshape, Transpose
+- Costly, via lookup arguments or polynomial approximation: ReLU (range checks), GELU,
+  Sigmoid, Softmax, LayerNorm. Specialised stacks solve these (zkLLM's tlookup and
+  zkAttn primitives handle softmax attention and normalisation [S1]); general-purpose
+  compilers often blow up or fail on them.
+- Fragile or unsupported in most compilers: dynamic shapes, control flow, top-k and
+  sampling operators, BatchNorm edge cases.
+
+Note the coverage gap precisely: the ONNX standard defines well over 140 core operators
+across its `ai.onnx` and `ai.onnx.ml` domains, and the set grows with each opset [S15].
+ZK compilers cover a subset. EZKL, the most widely used toolkit, accepts ONNX opsets 9
+to 18 and lowers the graph through the tract library into roughly 20 primitive
+operations that it actually constrains [S16]. Coverage is achieved by decomposition, not
+breadth, and models that do not decompose cleanly fail preflight.
+
+### Stage 2: Quantization and circuit compilation
+
+The critical honest detail: ZK circuits operate over finite fields (modular integer
+arithmetic) while models use IEEE 754 floating point, so every model must be quantized to
+fixed-point integers before compilation. Show a scale-factor slider (bit widths 8, 16, 24)
+and a live readout of the resulting accuracy delta. Use two honest reference points
+rather than one number: naive fixed-point quantization typically costs 0.5 to 2 percent
+on benchmark tasks [S17], while 16-bit lookup-table designs report near-zero degradation
+(NanoZK measures perplexity deltas below 10^-4 on GPT-2-class models [S6]; DeepProve
+claims accuracy preservation as a headline feature [S7]). The slider should move between
+these regimes.
+
+Display prominently: **the circuit proves the quantized model, not the floating-point
+model you uploaded.** These are different artifacts.
+
+Then show compilation output: constraint count, number of advice columns, lookup table
+size, proving key size, verification key size, estimated proving time and peak memory.
+Offer a proving-system selector with honest tradeoffs:
+
+- Halo2/Plonkish (as in EZKL): lookup-argument support, no per-circuit trusted setup
+  with the IPA backend, heavy prover, proofs in the 1 to 10 kB range
+- Groth16: constant proofs of roughly 128 to 200 bytes, millisecond verification,
+  constant onchain verification cost, but a circuit-specific trusted setup
+- GKR/sumcheck stack (as in zkLLM, DeepProve, Kaizen): fastest known prover for ML
+  workloads, larger proofs (zkLLM stays under 200 kB for a 13B forward pass [S1];
+  Kaizen's training proof is 1.63 MB [S8]), verification in hundreds of milliseconds to
+  seconds rather than milliseconds
+
+Add a warning banner here: in this design the weights enter the circuit as a private
+witness, so the circuit encodes only the **architecture**, and every fine-tune of the
+same architecture compiles to an identical circuit. The circuit does not identify the
+model. That is Stage 3's job.
+
+### Stage 3: Audit event (the commitment ceremony)
+
+This is where model identity is established. The provider publishes a polynomial or vector
+commitment to the weights while the weights themselves stay private as a witness. For
+realism, the fake commitment output can mirror zkLLM's actual scheme: Hyrax-style
+Pedersen commitments over BLS12-381 [S1].
+
+UI: a ceremony screen with a stepper.
+
+1. Compute weight commitment (show a fake 32-byte commitment in monospace)
+2. Bind commitment to circuit hash and quantization parameters
+3. Optional third-party auditor attestation (show 0 to 3 auditor signatures)
+4. Publish to a transparency log (render an append-only log view, Certificate
+   Transparency style, with a Merkle root and inclusion proof)
+
+The output is a **Model Passport**: an artifact card carrying model name, commitment,
+circuit hash, quantization scale, proving system, audit date, auditor signatures, and
+transparency log index. This card is reused across the app.
+
+Make the analogy explicit in a sidebar: this is the certificate issuance step, and the
+transparency log is the CT log. Also state the disanalogy plainly, because a knowledgeable
+reader will raise it: TLS authenticates an endpoint and secures a channel, and it never
+certifies that the server computed anything correctly. That is the gap this system fills.
+
+### Stage 4: Verified chat
+
+A chat interface against a model that holds a passport. Each assistant message carries a
+verification state badge:
+
+- `UNVERIFIED` (Charcoal): served without a proof, which is the majority of messages
+- `SIGNED` (Ochre): output signed at serving time, binding the provider to it before they
+  learn whether this turn will be audited
+- `AUDITED` (Forest): a ZK proof was generated and checked against the passport commitment
+- `FAILED` (Terracotta): proof verification failed
+
+State the proof scope in the badge tooltip, because researchers will ask: the proof
+covers one forward pass producing logits under the committed weights, bound to the input.
+Token sampling is a separate step; verifiable greedy and top-k decoding is its own recent
+line of work (zkAgent's zkDecode amortises to fractions of a second of prover time per
+generated token [S9]), and the demo should say whether the decode step is inside or
+outside the proof. Default: outside, and labelled as such.
+
+The audit is triggered on a **random subset** of turns. Expose the audit rate as a slider
+(1 to 100 percent) and show the consequence live: expected verification cost per session
+and the detection probability against a provider cheating on a single turn. Make the
+statistical nature unmissable, with two lines: at a 10 percent audit rate, a provider
+cheating on one specific response escapes detection 90 percent of the time; a provider
+cheating on every turn of a 50-turn session escapes with probability 0.9^50, roughly
+0.5 percent. Sustained cheating is caught quickly; targeted cheating on the one
+high-stakes query is not.
+
+Include a **renegotiation timer** in the header, modelled on TLS session renegotiation:
+re-verify after N turns or T minutes, whichever comes first, with the countdown visible.
+
+Add an **attack simulator** in a developer drawer, which is the most persuasive part of the
+demo. Let the user inject:
+
+- Model substitution: silently swap to a smaller model after the audit event. Proof
+  fails, badge turns Terracotta, and a diff panel shows commitment mismatch.
+- Silent quantization: serve a 4-bit version of an 8-bit committed model. Proof fails.
+- Cache replay: return a stored response for a new prompt. Proof fails on input binding.
+- Hollow-LLM: the provider declares a large architecture but commits, at the audit event
+  itself, to ghost weights whose algebraic structure collapses the effective
+  computation to that of a much smaller model. **Proof passes.** This is the point, and
+  the timing matters: substitution after commitment is caught, hollow commitment from the
+  start is not. Show a Terracotta explanation panel stating that verification succeeded
+  and the guarantee still did not hold, citing Gong, Liu, and Li (IEEE S&P 2026, DOI
+  10.1109/SP63933.2026.00258): proof of correct inference is not proof of large-model
+  execution [S10]. The panel should also note that the obvious mitigations fail: the
+  paper shows that structural subproofs such as non-zero or sparsity checks add heavy
+  overhead and can still be satisfied by ghost weights engineered around them.
+
+### Stage 5: Where Lean fits
+
+A separate screen, deliberately distinct from the cryptography, because it answers a
+different question.
+
+Framing to display: the ZK proof answers "did the committed model produce this output".
+Formal specification answers "is this output one the system is permitted to produce".
+Neither implies the other, and a system can be authentic and harmful or safe and
+unaudited.
+
+UI: a policy editor with two panes. Left, natural language policy, for example "the agent
+must not disclose a customer account balance without a completed identity check". Right,
+the autoformalized Lean 4 statement of that policy over an execution trace. Show a
+translation status: translated, elaborated, unproven obligations remaining (render these
+as `sorry` placeholders, which is how Lean reports incomplete proofs).
+
+Show a per-turn policy check in the chat alongside the proof badge, so the two guarantee
+types sit side by side and are visibly independent. A response can be `AUDITED` and
+`POLICY VIOLATION` at the same time, and the demo should show exactly that case at least
+once.
+
+Reference in a footnote that policy autoformalization into Lean 4 is active work: the
+Lean-Agent Protocol treats every proposed agent action as a conjecture that must be
+proved against pre-compiled regulatory axioms, using Harmonic AI's Aristotle model for
+autoformalization (Rashie and Rashi, "Type-Checked Compliance", arXiv 2604.01483 [S11]);
+Aristotle itself reached gold-medal performance at IMO 2025 with machine-checked Lean 4
+solutions [S12]; and Mathlib currently holds 284,145 theorems and 134,991 definitions
+from 772 contributors [S13], so the substrate for nontrivial policy mathematics exists.
+
+## Also required: a Training tab, honestly marked out of reach
+
+The user asked about proof of training as well as inference. Include the screen, but mark
+it `RESEARCH DIRECTION, NOT CURRENTLY FEASIBLE`.
+
+Content: a customer paying a third party to train a model receives only a weights file and
+has no guarantee the contracted computation ran. The cryptographic shape is a zero-knowledge
+proof of training (zkPoT), where the prover commits to dataset and resulting model and
+proves the model is the result of the claimed procedure on that data. Cite Kaizen
+(Abbaszadeh, Pappas, Katz, and Papadopoulos, CCS 2024; ePrint 2024/162), which uses
+GKR-style proofs per gradient-descent iteration composed via incremental verifiable
+computation, so proof size (1.63 MB) and verifier time (130 ms) stay independent of
+iteration count and dataset size [S8].
+
+Then show why it does not work yet, with a chart built on Kaizen's own benchmark: 15
+minutes of proving per training iteration on VGG-11, a 10-million-parameter network at
+batch size 16 [S8], against roughly 10^5 to 10^6 optimizer steps in a real pretraining
+run. Let the user enter a parameter count and step count and display the resulting
+proving time in years. The calculator extrapolates linearly in parameters from the
+Kaizen baseline and must display that assumption on the chart, because prover cost is
+quasi-linear in circuit size, not exactly linear in parameters. Two anchor readouts to
+pre-populate: Kaizen's own 10M-parameter model at 500,000 steps is 14.3 years of proving
+with no scaling at all, and a 7B-parameter model under the linear assumption lands in
+the thousands of years.
+
+Offer the weaker statements that might be affordable, as greyed-out design proposals:
+proof over a randomly sampled subset of training steps; proof over the fine-tuning stage
+only, where the parameter delta is small (recent PEFT-restricted prototypes report
+per-step prover times of 16.8 seconds for a rank-8 LoRA update over 2048 tokens, which is
+the right order of magnitude to matter [S14]); and proof of dataset membership or
+exclusion without proving the optimisation.
+
+## Real numbers to use in the mockup
+
+Use these rather than inventing figures. Label the source in a tooltip, wired to the
+Source Register entries below.
+
+- zkLLM (Sun, Li, and Zhang, CCS 2024): 986 s of commitment generation and 803 s of
+  proving per forward pass on LLaMA-2-13B, with a proof under 200 kB [S1]. TOPLOC's
+  authors extrapolate those per-pass costs across a 2000-token generation to roughly 23
+  days of commitment work and 18 days of proving [S2]; present it as their extrapolation,
+  and note the weight commitment is one-time while per-inference commitments to
+  intermediate tensors recur.
+- Independent replication on LLaMA-2-7B using zkLLM's released code: 388.3 s proving,
+  183 kB proof, 2.36 s verification [S3].
+- General-purpose compilers, measured on identical hardware: ZKML (EuroSys 2024) proves
+  GPT-2 in 3,601 s; ZKTorch cuts that to 599 s with 12 s verification; EZKL needs 966 s
+  for a 1-million-parameter nanoGPT and is generally reported to struggle beyond that
+  scale [S4].
+- The current speed frontier for small LLMs: zkGPT proves GPT-2 in under 25 s using GKR
+  [S5]; NanoZK proves a 12-layer GPT-2-Small in 8.6 minutes sequentially or 3.2 minutes
+  with 12 parallel workers, at 6.9 kB per layer [S6]; zkPyTorch reports VGG-16 (138M
+  parameters) in 2.2 s and Llama-3 at roughly 150 s per token [S18].
+- Lagrange DeepProve: launch benchmarks show 54x to 158x faster proving than EZKL and
+  verification 671x faster for MLPs and 521x for CNNs, bringing verification to about
+  half a second; the company's headline claim is up to 1000x proving. The June 2026
+  open-source release claims LLM proofs 60x faster than the prior state of the art, with
+  GPT-2 and Gemma-3 proven end-to-end and over 12 million proofs generated in production
+  [S7]. Quote the measured ranges, not only the headline.
+- Training: Kaizen, 15 min per iteration on 10M-parameter VGG-11, proof 1.63 MB,
+  verifier 130 ms, both independent of iteration count [S8].
+- Memory: Modulus Labs' The Cost of Intelligence benchmarked provers on Worldcoin's
+  1.8-million-parameter, 50-layer iris model; Plonky2 proves it in minutes on server
+  CPUs but consumes tens of gigabytes of prover RAM, out of reach of any mobile device
+  [S17a].
+- Quantization accuracy penalty: 0.5 to 2 percent for naive fixed-point conversion
+  [S17]; below 0.1 percent, and measured below 10^-4 perplexity delta, for 16-bit
+  lookup-table designs [S6, S7].
+- Verification, by contrast, ranges from milliseconds (Groth16 onchain; NanoZK under 25
+  ms per layer; Kaizen 130 ms) to a few seconds (zkLLM 2.36 s; ZKTorch 12 s) [S1, S3,
+  S4, S6, S8]. Against hours-to-days of proving, the asymmetry is four to six orders of
+  magnitude and it is the whole point, so make it visually obvious: put proving time and
+  verification time on the same log-scale axis.
+
+## A dedicated Limits page
+
+Not a footer. A navigation item, with these sections written as prose:
+
+1. **Execution integrity is not correctness.** State it plainly with the harmful-output
+   example.
+2. **Undetectable backdoors.** Goldwasser, Kim, Vaikuntanathan, and Zamir (FOCS 2022)
+   construct backdoors that are computationally undetectable given full white-box access
+   [S19]. Proving you ran the committed weights says nothing about whether those weights
+   are trustworthy.
+3. **Hollow-LLM.** Gong, Liu, and Li, IEEE S&P 2026 [S10]. Ghost weights satisfy the
+   verification circuit at much lower serving cost, so verification does not bind
+   correctness to computational work, and the paper shows sparsity-style countermeasures
+   are both expensive and insufficient.
+4. **The proof is about the quantized circuit**, not the floating-point model.
+5. **Sampling gives statistical guarantees.** Detection probability equals the audit rate
+   for a single targeted deviation.
+6. **Alternatives with different trust roots**, presented as a comparison table rather
+   than dismissed: TEE attestation (NVIDIA H100 confidential computing, cheap and
+   deployed today, but trusts the hardware vendor and the enclave); optimistic
+   re-execution with refereed bisection (Verde with its RepOps library for bitwise
+   reproducibility [S20], opML [S21]); activation-fingerprint sampling (TOPLOC, ICML
+   2025, 258 bytes of commitment per 32 tokens and validation up to 100x faster than
+   inference [S2]; SVIP, which needs a trained detection model per target [S22]); and
+   full ZK. Columns: trust root, prover overhead, verifier cost, what it proves, what it
+   misses.
+7. **GPU nondeterminism.** Identical weights on different hardware, or even across
+   reorderings on the same hardware, produce different floating-point outputs, which
+   breaks naive verification by re-execution; Verde had to build an entire operator
+   library (RepOps) to pin floating-point operation order across hardware [S20], and it
+   is part of why fixed-point quantization is required on the ZK path.
+
+## What not to build
+
+- No fake blockchain integration unless it is clearly labelled as the transparency log
+- No claim that this makes a model "safe", "aligned", or "trustworthy"; the word to use is
+  "authentic"
+- No progress bar that completes in two seconds for a proof the literature says takes hours;
+  if you compress time, show a `TIME COMPRESSED 1000x` label
+- No localStorage or sessionStorage
+- No login, no billing, no settings page
+
+## Acceptance criteria
+
+1. A user can carry one model through upload, preflight, quantization, compilation, audit
+   ceremony, and into chat, and see a passport at the end.
+2. The chat shows all four verification states across a session, with the audit rate slider
+   visibly changing how often proofs appear.
+3. The attack simulator demonstrates three attacks that verification catches and one that
+   it does not, and makes the commitment-timing distinction between them explicit.
+4. The Lean screen shows a response that is cryptographically verified and simultaneously
+   in policy violation.
+5. The training tab lets a user compute, from Kaizen's real per-iteration numbers, a
+   proving time in years for a realistic model, with the scaling assumption displayed.
+6. Every fabricated cryptographic value carries a `SIMULATED` tag.
+7. The Limits page is reachable in one click from anywhere.
+8. Every number from the Real Numbers section renders with a tooltip naming its Source
+   Register entry.
+
+## Source Register
+
+Ship this as a data file (`src/mock/sources.ts`) so tooltips reference it.
+
+- **S1** Sun, Li, Zhang. zkLLM: Zero Knowledge Proofs for Large Language Models. ACM CCS
+  2024, doi 10.1145/3658644.3670334; arXiv 2404.16109. Backs: 986 s commitment, 803 s
+  proving per forward pass on LLaMA-2-13B, proof under 200 kB, tlookup and zkAttn,
+  Hyrax/Pedersen commitments over BLS12-381.
+- **S2** Ong, Di Ferrante, Pazdera, Garner, Jaghouar, Basra, Hagemann. TOPLOC: A Locality
+  Sensitive Hashing Scheme for Trustless Verifiable Inference. ICML 2025; arXiv
+  2501.16007. Backs: the 23-day and 18-day extrapolations of zkLLM's per-pass costs; 258
+  bytes per 32 tokens; validation up to 100x faster than inference; robustness across
+  GPU types and algebraic reorderings.
+- **S3** Towards Verifiable AI with Lightweight Cryptographic Proofs of Inference. arXiv
+  2603.19025. Backs: zkLLM on LLaMA-2-7B measured at 388.3 s proving, 183 kB proof,
+  2.36 s verification using the released zkLLM code.
+- **S4** Chen, Waiwitlikhit, Stoica, Kang. ZKML: An Optimizing System for ML Inference in
+  Zero-Knowledge Proofs. EuroSys 2024; and ZKTorch, arXiv 2507.07031. Backs: GPT-2 in
+  3,601 s (ZKML) versus 599 s with 12 s verification (ZKTorch) on identical hardware;
+  EZKL at 966 s for 1M-parameter nanoGPT.
+- **S5** Qu et al. zkGPT (2025). Backs: sub-25-second GPT-2 proofs via GKR.
+- **S6** NanoZK: layerwise zero-knowledge proofs for verifiable LLM inference. arXiv
+  2603.18046. Backs: 6.9 kB per-layer proofs, under 25 ms per-layer verification,
+  GPT-2-Small in 8.6 min sequential or 3.2 min parallel, EZKL MLP-512 at 7,503 s versus
+  33 s, perplexity deltas below 10^-4 with 16-bit lookups.
+- **S7** Lagrange. Announcing DeepProve (Feb 2025) and DeepProve open-source release
+  (June 3, 2026), lagrange.dev. Backs: 54x to 158x proving speedup versus EZKL,
+  verification 671x (MLP) and 521x (CNN) to about half a second, headline up-to-1000x
+  claim, LLM proofs 60x faster than prior state of the art, GPT-2 and Gemma-3
+  end-to-end, 12M+ proofs in production, ONNX/safetensors/GGUF ingestion.
+- **S8** Abbaszadeh, Pappas, Katz, Papadopoulos. Kaizen: zero-knowledge proofs of
+  training for deep neural networks. ACM CCS 2024; ePrint 2024/162. Backs: 15 min per
+  iteration on 10M-parameter VGG-11 at batch size 16, 24x faster and 27x less memory
+  than generic recursion, 1.63 MB proof, 130 ms verifier, both independent of iteration
+  count.
+- **S9** zkAgent: verifiable LLM agent execution. ePrint 2026/199. Backs: verifiable
+  greedy and top-k decoding (zkDecode) at sub-second amortised prover time per token;
+  the observation that decode is a separate proof obligation from the forward pass.
+- **S10** Gong, Liu, Li. Hollow-LLM Attack: Computationally Trivial Weights in
+  Zero-Knowledge Verification of LLM Inference. IEEE S&P 2026, doi
+  10.1109/SP63933.2026.00258; arXiv 2607.28884. Backs: ghost weights that keep the
+  declared architecture and parameter count, produce valid proofs, collapse serving
+  cost, and defeat sparsity-style countermeasures; the sentence "proof of correct
+  inference is not proof of large-model execution".
+- **S11** Rashie, Rashi. Type-Checked Compliance: Deterministic Guardrails for Agentic
+  Financial Systems Using Lean 4 Theorem Proving. arXiv 2604.01483. Backs: the
+  Lean-Agent Protocol, autoformalization of institutional policy into Lean 4 via
+  Aristotle, action-as-conjecture gating.
+- **S12** The Harmonic Team. Aristotle: IMO-level Automated Theorem Proving. arXiv
+  2510.01346. Backs: IMO 2025 gold-medal performance with machine-verifiable Lean 4
+  solutions.
+- **S13** Mathlib statistics, leanprover-community.github.io/mathlib_stats.html,
+  retrieved August 2026. Backs: 284,145 theorems, 134,991 definitions, 772 contributors.
+- **S14** Verifiable Fine-Tuning for LLMs. arXiv 2510.16830. Backs: 16.8 s per-step
+  prover time for rank-8 LoRA over 2048 tokens, 23.6 GB peak memory.
+- **S15** ONNX operator documentation, onnx.ai/onnx/operators. Backs: 124 operators in
+  ai.onnx plus 19 in ai.onnx.ml as commonly counted, growing by opset.
+- **S16** EZKL documentation and OpenGradient model restrictions. Backs: ONNX opsets 9 to
+  18 supported; graph lowering through tract into roughly 20 constrained primitive
+  operations.
+- **S17** Zylos Research, Zero-Knowledge Proofs for AI Agent Verification (2026), for the
+  0.5 to 2 percent naive-quantization range; treat as a secondary source and pair it
+  with S6/S7 for the lookup-table regime. **S17a** Modulus Labs. The Cost of
+  Intelligence (Jan 2023, EF grant). Backs: 1.8M-parameter model proved in minutes on
+  server CPUs with tens of GB of prover RAM.
+- **S18** zkPyTorch (Polyhedra, 2025), developer-reported: VGG-16 in 2.2 s; Llama-3 at
+  roughly 150 s per token. Label as developer claims.
+- **S19** Goldwasser, Kim, Vaikuntanathan, Zamir. Planting Undetectable Backdoors in
+  Machine Learning Models. FOCS 2022; arXiv 2204.06974.
+- **S20** Arun, St. Arnaud, Titov, Wilcox, Kolobaric, Brinkmann, Ersoy, Fielding,
+  Bonneau. Verde: Verification via Refereed Delegation for Machine Learning Programs.
+  arXiv 2502.19405. Backs: refereed bisection for ML programs; RepOps for bitwise
+  cross-hardware reproducibility.
+- **S21** Conway, So, Yu, Wong. opML: Optimistic Machine Learning on Blockchain (2024);
+  arXiv 2401.17555.
+- **S22** SVIP: Towards Verifiable Inference of Open-source Large Language Models. arXiv
+  2410.22307. Backs: secret-based activation verification; requires training a
+  detection model per target model (per TOPLOC's comparison table).
