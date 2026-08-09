@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Verified Inference Gateway"
+description = "A frontend-only research demonstrator of verifiable AI inference (zkML). Simulates the full pipeline — model upload with operator preflight, quantization and circuit compilation, an audit commitment ceremony, and verified chat with ZK proof badges — plus an attack simulator, a Lean 4 policy screen, a zk proof-of-training calculator, and a Limits page. All cryptography is simulated and labelled; every literature number is wired to a source register tooltip. Audience: cryptography and AI safety researchers."
+version = "1.0.0"
+id = "artifacts/verified-inference-gateway"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 26035
+
+[services.development]
+run = "pnpm --filter @workspace/verified-inference-gateway run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/verified-inference-gateway", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/verified-inference-gateway/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "26035"
+BASE_PATH = "/"
